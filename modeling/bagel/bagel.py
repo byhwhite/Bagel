@@ -215,18 +215,27 @@ class Bagel(PreTrainedModel):
         )
 
         mse = None
+        mse_timesteps = None
+        pred_flow = None
+        target_flow = None
         if self.config.visual_gen:
             packed_mse_preds = self.llm2vae(last_hidden_state[mse_loss_indexes])
             target = noise - packed_latent_clean # NOTE: v_t=dx_t/dt=x_1-x_0, pointing from data to noise
             has_mse = packed_timesteps > 0
             mse = (packed_mse_preds - target[has_mse]) ** 2
+            pred_flow = packed_mse_preds
+            target_flow = target[has_mse]
+            mse_timesteps = packed_timesteps[has_mse]
+            mse = (pred_flow - target_flow) ** 2
 
         ce = None
         if ce_loss_indexes is not None:
             packed_ce_preds = self.language_model.lm_head(last_hidden_state[ce_loss_indexes])
             ce = F.cross_entropy(packed_ce_preds, packed_label_ids, reduction="none")
 
-        return dict(mse=mse, ce=ce)
+        # return dict(mse=mse, ce=ce)
+        return dict(mse=mse, ce=ce, mse_timesteps=mse_timesteps, pred_flow=pred_flow, target_flow=target_flow)
+
 
 
     def prepare_prompts(self, curr_kvlens, curr_rope, prompts, tokenizer, new_token_ids):
