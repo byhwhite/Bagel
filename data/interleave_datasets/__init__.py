@@ -2,4 +2,4 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from .edit_dataset import UnifiedEditIterableDataset
-
+from .ct_t2v_dataset import CTText2VideoIterableDataset
