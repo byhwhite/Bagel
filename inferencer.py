@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from copy import deepcopy
-from typing import List, Dict, Optional, Union, Any
+from typing import List, Dict, Optional, Union, Any, Tuple
 
 from PIL import Image
 import torch
@@ -184,6 +184,122 @@ class InterleaveInferencer:
 
         return image
 
+    def _decode_latent_to_tensor(self, latent: torch.Tensor, image_shape: Tuple[int, int]) -> torch.Tensor:
+        H, W = image_shape
+        h, w = H // self.model.latent_downsample, W // self.model.latent_downsample
+        latent = latent.reshape(
+            1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel
+        )
+        latent = torch.einsum("nhwpqc->nchpwq", latent)
+        latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
+        image = self.vae_model.decode(latent)
+        image = (image * 0.5 + 0.5).clamp(0, 1)[0]  # [C,H,W]
+        return image
+
+    def gen_video(
+        self,
+        image_shape: Tuple[int, int],
+        gen_context: Dict[str, Any],
+        num_frames: int = 11,
+        frame_delta: int = 3,
+        cfg_text_scale=4.0,
+        cfg_img_scale=1.5,
+        cfg_text_precontext=None,
+        cfg_img_precontext=None,
+        cfg_interval=(0.4, 1.0),
+        cfg_renorm_min=0.0,
+        cfg_renorm_type="global",
+        num_timesteps=50,
+        timestep_shift=3.0,
+        enable_taylorseer=False,
+    ) -> List[Image.Image]:
+        """
+        Generate all frames in one diffusion pass by packing multiple frame slots with
+        temporally shifted rope ids (aligned with ct_t2v training style).
+        """
+        past_key_values = gen_context['past_key_values']
+        kv_lens = gen_context['kv_lens']
+        ropes = gen_context['ropes']
+        base_rope = ropes[0]
+        frame_ropes = [base_rope + i * max(1, frame_delta) for i in range(num_frames)]
+        frame_kvlens = [kv_lens[0]] * num_frames
+        frame_shapes = [image_shape] * num_frames
+
+        generation_input = self.model.prepare_vae_latent(
+            curr_kvlens=frame_kvlens,
+            curr_rope=frame_ropes,
+            image_sizes=frame_shapes,
+            new_token_ids=self.new_token_ids,
+        )
+        generation_input_cfg_text = self.model.prepare_vae_latent_cfg(
+            curr_kvlens=[cfg_text_precontext['kv_lens'][0]] * num_frames,
+            curr_rope=frame_ropes,
+            image_sizes=frame_shapes,
+        )
+        generation_input_cfg_img = self.model.prepare_vae_latent_cfg(
+            curr_kvlens=[cfg_img_precontext['kv_lens'][0]] * num_frames,
+            curr_rope=frame_ropes,
+            image_sizes=frame_shapes,
+        )
+
+        unpacked_latents = self.model.generate_image(
+            past_key_values=past_key_values,
+            cfg_text_past_key_values=cfg_text_precontext['past_key_values'],
+            cfg_img_past_key_values=cfg_img_precontext['past_key_values'],
+            num_timesteps=num_timesteps,
+            cfg_text_scale=cfg_text_scale,
+            cfg_img_scale=cfg_img_scale,
+            cfg_interval=cfg_interval,
+            cfg_renorm_min=cfg_renorm_min,
+            cfg_renorm_type=cfg_renorm_type,
+            timestep_shift=timestep_shift,
+            **generation_input,
+            cfg_text_packed_position_ids=generation_input_cfg_text['cfg_packed_position_ids'],
+            cfg_text_packed_query_indexes=generation_input_cfg_text['cfg_packed_query_indexes'],
+            cfg_text_key_values_lens=generation_input_cfg_text['cfg_key_values_lens'],
+            cfg_text_packed_key_value_indexes=generation_input_cfg_text['cfg_packed_key_value_indexes'],
+            cfg_img_packed_position_ids=generation_input_cfg_img['cfg_packed_position_ids'],
+            cfg_img_packed_query_indexes=generation_input_cfg_img['cfg_packed_query_indexes'],
+            cfg_img_key_values_lens=generation_input_cfg_img['cfg_key_values_lens'],
+            cfg_img_packed_key_value_indexes=generation_input_cfg_img['cfg_packed_key_value_indexes'],
+            enable_taylorseer=enable_taylorseer,
+        )
+        return [self.decode_image(latent, image_shape) for latent in unpacked_latents]
+
+    def save_video_as_niigz(
+        self,
+        frames: List[Image.Image],
+        save_path: str,
+        channel_mode: str = "mean",
+    ) -> str:
+        """
+        Save generated frames as a NIfTI volume (.nii.gz).
+        channel_mode:
+          - "mean": RGB -> grayscale by mean over channels, output [D,H,W]
+          - "rgb": keep RGB, output [D,H,W,3]
+        """
+        import numpy as np
+        import nibabel as nib
+
+        if len(frames) == 0:
+            raise ValueError("frames is empty; cannot save nii.gz.")
+
+        vol = []
+        for frame in frames:
+            arr = np.asarray(frame).astype(np.float32) / 255.0
+            if channel_mode == "mean":
+                if arr.ndim == 3:
+                    arr = arr.mean(axis=-1)
+            elif channel_mode == "rgb":
+                pass
+            else:
+                raise ValueError(f"Unsupported channel_mode: {channel_mode}")
+            vol.append(arr)
+        vol = np.stack(vol, axis=0)
+        img = nib.Nifti1Image(vol, affine=np.eye(4))
+        nib.save(img, save_path)
+        return save_path
+
     @torch.no_grad()
     def gen_text(self, gen_context, max_length: int = 500, do_sample: bool = True, temperature: float = 1.0):
         gen_context = deepcopy(gen_context)
@@ -289,9 +405,14 @@ class InterleaveInferencer:
         self, 
         image: Optional[Image.Image] = None, 
         text: Optional[str] = None, 
+        t2v: bool = False,
+        num_frames: int = 11,
+        frame_delta: int = 3,
+        nii_save_path: Optional[str] = None,
+        nii_channel_mode: str = "mean",
         **kargs
     ) -> Dict[str, Any]:
-        output_dict = {'image': None, 'text': None}
+        output_dict = {'image': None, 'text': None, 'video_frames': None, 'nii_path': None}
 
         if image is None and text is None:
             print('Please provide at least one input: either an image or text.')
@@ -302,6 +423,34 @@ class InterleaveInferencer:
             input_list.append(image)
         if text is not None:
             input_list.append(text)
+
+        if t2v:
+            gen_context = self.init_gen_context()
+            with torch.autocast(device_type="cuda", enabled=True, dtype=torch.bfloat16):
+                for input_term in input_list:
+                    if isinstance(input_term, str):
+                        gen_context = self.update_context_text(input_term, gen_context)
+                    elif isinstance(input_term, Image.Image):
+                        input_term = self.vae_transform.resize_transform(pil_img2rgb(input_term))
+                        gen_context = self.update_context_image(input_term, gen_context, vae=True, vit=False)
+                image_shape = kargs.pop("image_shapes", (384, 384))
+                cfg_text_context = deepcopy(gen_context)
+                cfg_img_context = deepcopy(gen_context)
+                frames = self.gen_video(
+                    image_shape=image_shape,
+                    gen_context=gen_context,
+                    num_frames=num_frames,
+                    frame_delta=frame_delta,
+                    cfg_text_precontext=cfg_text_context,
+                    cfg_img_precontext=cfg_img_context,
+                    **kargs,
+                )
+            output_dict["video_frames"] = frames
+            if len(frames) > 0:
+                output_dict["image"] = frames[-1]
+            if nii_save_path is not None:
+                output_dict["nii_path"] = self.save_video_as_niigz(frames, nii_save_path, channel_mode=nii_channel_mode)
+            return output_dict
 
         output_list = self.interleave_inference(input_list, **kargs)
 
